@@ -9,16 +9,6 @@ from mojo_opset.core import MojoQuantMoE
 from ixformer import functions as ixf_f
 import ixformer.distributed as ixfd
 
-def decompose_fp32_to_3bf16(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-
-    x0 = x.bfloat16()
-    r1 = x - x0.float()
-    x1 = r1.bfloat16()
-    r2 = r1 - x1.float()
-    x2 = r2.bfloat16()
-
-    return x0, x1, x2
-
 def _repack_int4_tn_to_nn(packed_tn: torch.Tensor, N: int, K: int) -> torch.Tensor:
     """
     Pure layout conversion: TN-packed int4 -> NN-packed int4 with tensor-core swizzle.
@@ -173,25 +163,12 @@ def _unswizzle_weights_state_dict_post_hook(module, state_dict, prefix, local_me
             state_dict[down_key] = state_dict[down_key].transpose(1, 2).contiguous()
 
 
-def _attach_gating_bf16_buffers(gating_module):
-    """Attach gate_weight bf16 TN buffers and post-hook to a parameter-holder gating module."""
-    num_experts = gating_module.gate_weight.shape[1]
-    hidden_size = gating_module.gate_weight.shape[0]
-    for name in ("gate_weight_bf16_tn_0", "gate_weight_bf16_tn_1", "gate_weight_bf16_tn_2"):
-        gating_module.register_buffer(
-            name,
-            torch.empty((num_experts, hidden_size), dtype=torch.bfloat16, device=gating_module.gate_weight.device),
-            persistent=False,
-        )
-
-    def _transform_gate_weight_post_hook(module, incompatible_keys):
-        gate_weight = module.gate_weight.data.T.contiguous()
-        gw0, gw1, gw2 = decompose_fp32_to_3bf16(gate_weight)
-        module.register_buffer("gate_weight_bf16_tn_0", gw0)
-        module.register_buffer("gate_weight_bf16_tn_1", gw1)
-        module.register_buffer("gate_weight_bf16_tn_2", gw2)
-
-    gating_module.register_load_state_dict_post_hook(_transform_gate_weight_post_hook)
+def _cast_gate_weight_post_hook(module, incompatible_keys):
+    # fp32 (hidden, num_experts) -> bf16 (num_experts, hidden), the TN layout.
+    module.gate_weight = torch.nn.Parameter(
+        module.gate_weight.detach().to(torch.bfloat16).transpose(0, 1).contiguous(),
+        requires_grad=module.gate_weight.requires_grad,
+    )
 
 
 class IxformerMoE(MojoMoE):
@@ -223,7 +200,7 @@ class IxformerMoE(MojoMoE):
             ep_group=ep_group,
             **kwargs,
         )
-        _attach_gating_bf16_buffers(self.gating)
+        self.gating.register_load_state_dict_post_hook(_cast_gate_weight_post_hook)
 
         # GDR buffer feeds per-expert token counts back to the GPU without a CPU sync.
         self.gdr_device_buffer = torch.zeros([self.num_experts + 1], dtype=torch.int, device="cuda")
@@ -254,12 +231,9 @@ class IxformerMoE(MojoMoE):
             ixfd.all_gather_into_tensor(full, hidden_states.contiguous(), group=self.ep_group, async_op=True)
             hidden_states = full
 
-        # triple_gemm uses 3 bf16 components of the fp32 gate weight to emulate fp32 matmul precision on bf16 HW.
-        gate_logits = ixf_f.triple_gemm_bf16_bf16_fp32(
+        gate_logits = ixf_f.gemm_bf16_bf16_fp32(
             hidden_states,
-            self.gating.gate_weight_bf16_tn_2,
-            self.gating.gate_weight_bf16_tn_1,
-            self.gating.gate_weight_bf16_tn_0,
+            self.gating.gate_weight,
         )
         top_k_gates, top_k_indices = ixf_f.moe_topk_softmax(gate_logits, self.gating.top_k, renormalize=True)
 
@@ -429,7 +403,7 @@ class IxformerQuantMoE(MojoQuantMoE):
         if os.environ.get("IXFORMER_DISABLE_SYNC", "0").strip().lower() == "1" and (self.up_weight_dtype != "int4" or self.down_weight_dtype != "int4"):
             raise NotImplementedError(f"IxformerQuantMoE: up_weight_dtype or down_weight_dtype is not 'int4', is not supported when disable_sync is True.")
 
-        _attach_gating_bf16_buffers(self.gating)
+        self.gating.register_load_state_dict_post_hook(_cast_gate_weight_post_hook)
 
         # Hardware constraints of the ixformer w8a8/w4a8 group-gemm kernels.
         if self.hidden_size % 64 != 0 or self.intermediate_size % 64 != 0:
@@ -529,11 +503,9 @@ class IxformerQuantMoE(MojoQuantMoE):
             )
 
             # gating on local hidden_states — runs on compute stream while AG(h) flies.
-            local_gate_logits = ixf_f.triple_gemm_bf16_bf16_fp32(
+            local_gate_logits = ixf_f.gemm_bf16_bf16_fp32(
                 hidden_states,
-                self.gating.gate_weight_bf16_tn_2,
-                self.gating.gate_weight_bf16_tn_1,
-                self.gating.gate_weight_bf16_tn_0,
+                self.gating.gate_weight,
             )
             local_top_k_gates, local_top_k_indices = ixf_f.moe_topk_softmax(
                 local_gate_logits, self.gating.top_k, renormalize=True,
@@ -564,12 +536,9 @@ class IxformerQuantMoE(MojoQuantMoE):
             top_k_indices = full_top_k_indices
             top_k_gates = full_top_k_gates
         else:
-            # triple_gemm uses 3 bf16 components of the fp32 gate weight to emulate fp32 matmul precision on bf16 HW.
-            gate_logits = ixf_f.triple_gemm_bf16_bf16_fp32(
+            gate_logits = ixf_f.gemm_bf16_bf16_fp32(
                 hidden_states,
-                self.gating.gate_weight_bf16_tn_2,
-                self.gating.gate_weight_bf16_tn_1,
-                self.gating.gate_weight_bf16_tn_0,
+                self.gating.gate_weight,
             )
             top_k_gates, top_k_indices = ixf_f.moe_topk_softmax(gate_logits, self.gating.top_k, renormalize=True)
 
