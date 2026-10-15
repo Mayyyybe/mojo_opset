@@ -27,43 +27,6 @@ _IXFORMER_PAGED_DECODE_SUPPORTED_HEAD_DIMS = frozenset(
     {32, 64, 80, 96, 128, 160, 192, 224, 256}
 )
 
-def _check_fp8_paged_prefill(
-    op_name: str,
-    query: torch.Tensor,
-    key_cache: torch.Tensor,
-    max_q_len: Optional[int],
-    max_total_seq_len: Optional[int],
-) -> None:
-    """Checks the facade and C++ bridge skip.
-
-    ``flash_attn_varlen_fp8_func`` already validates scales, output dtype and
-    ``block_table``; the C++ bridge already validates e4m3 q/k/v, CUDA,
-    last-dim contiguity and int32 cu_seqlens. Those are not repeated here.
-    ``head_dim % 64 == 0`` and page size fail inside ixattn as ``kInvalidValue``,
-    so they are raised as ``NotImplementedError`` for the test skip path.
-    """
-    head_dim = query.shape[-1]
-    if head_dim % 64 != 0:
-        raise NotImplementedError(
-            f"{op_name} only supports head_dim % 64 == 0, got {head_dim}; "
-            "ixattn has no fp8 FMHA kernel for other head dims."
-        )
-    page_block_size = key_cache.shape[2]
-    if page_block_size > 256 or page_block_size % 16 != 0:
-        raise NotImplementedError(
-            f"{op_name} only supports page_block_size <= 256 and % 16 == 0, "
-            f"got {page_block_size}."
-        )
-    if not isinstance(max_q_len, int) or max_q_len <= 0:
-        raise ValueError(
-            f"max_q_len must be a positive int, got {max_q_len} ({type(max_q_len)})."
-        )
-    if not isinstance(max_total_seq_len, int) or max_total_seq_len <= 0:
-        raise ValueError(
-            f"max_total_seq_len must be a positive int, got {max_total_seq_len} ({type(max_total_seq_len)})."
-        )
-
-
 def _check_int8_paged_kv_cache(
     key_cache: torch.Tensor,
     key_scale: torch.Tensor,
@@ -223,10 +186,6 @@ class IxformerPagedPrefillGQAFp8(MojoPagedPrefillGQAFp8):
         max_total_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         """Calls :func:`ixformer.functions.flash_attn_varlen_fp8_func`."""
-        assert_paged_prefill_contract(cu_q_lens, block_tables, cu_total_seq_lens)
-        _check_fp8_paged_prefill(
-            "IxformerPagedPrefillGQAFp8", query, key_cache, max_q_len, max_total_seq_len
-        )
         cu_kv_lens = cu_total_seq_lens if cu_total_seq_lens is not None else cu_q_lens
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(query.shape[-1])
@@ -445,10 +404,6 @@ class IxformerPagedPrefillSWAFp8(MojoPagedPrefillSWAFp8):
         max_total_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         """Calls :func:`ixformer.functions.flash_attn_varlen_fp8_func`."""
-        assert_paged_prefill_contract(cu_q_lens, block_table, cu_total_seq_lens)
-        _check_fp8_paged_prefill(
-            "IxformerPagedPrefillSWAFp8", q, k_cache, max_q_len, max_total_seq_len
-        )
         cu_kv_lens = cu_total_seq_lens if cu_total_seq_lens is not None else cu_q_lens
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(q.shape[-1])
