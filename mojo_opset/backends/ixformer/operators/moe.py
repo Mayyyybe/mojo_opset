@@ -785,6 +785,10 @@ class IxformerQuantMoE(MojoQuantMoE):
                 num_tokens * self.top_k, self.hidden_size,
                 dtype=self.output_dtype, device=sorted_token_ids.device,
             )
+            # The int8 ops fold dst_to_src into their epilogue and land in token
+            # order; moe_w4a8_group_gemm_ixmm has no such index and stays in
+            # expert-major order, which the reduce below has to account for.
+            expert_major = self.down_weight_dtype == "int4"
 
             if self.down_weight_dtype == torch.int8:
                 if not need_gpu_size:
@@ -812,50 +816,56 @@ class IxformerQuantMoE(MojoQuantMoE):
                         output=group_gemm_output2,
                     )
             elif self.down_weight_dtype == "int4":
-                # moe_w4a8_group_gemm_ixmm has no dst_to_src, so the scatter back
-                # to token order that the old kernel folded into its epilogue is
-                # a separate step here.
-                down_rows = torch.empty(
-                    (act_i8.shape[0], group_gemm_output2.shape[1]),
-                    dtype=self.output_dtype,
-                    device=act_i8.device,
-                )
+                # Row 0 is where the reduce below parks slots that carry no
+                # routed row. The GEMM leaves it untouched when nothing routes
+                # to a local expert, so it must not stay allocator garbage:
+                # 0 * NaN would survive the weighted sum.
+                group_gemm_output2[0].zero_()
                 ixf_f.moe_w4a8_group_gemm_ixmm(
                     a=act_i8,
                     weight=self.experts.down_proj_weight,
                     scale_a=act_scale,
                     weight_scale=self.experts.down_proj_weight_scale,
                     group_layout=group_layout,
-                    output=down_rows,
+                    output=group_gemm_output2[: act_i8.shape[0]],
                     group_size=self.down_quant_group_size,
                 )
-                # dst_to_src is -1 on slots that carry no routed token. Those
-                # rows land on a scratch row rather than being masked out, so
-                # the index keeps a fixed shape and the path stays graph
-                # capturable.
-                dst = sorted_token_ids[: down_rows.shape[0]].long()
-                scratch_row = group_gemm_output2.shape[0]
-                scattered = torch.empty(
-                    (scratch_row + 1, group_gemm_output2.shape[1]),
-                    dtype=group_gemm_output2.dtype,
-                    device=group_gemm_output2.device,
-                )
-                scattered[torch.where(dst >= 0, dst, scratch_row)] = down_rows
-                group_gemm_output2 = scattered[:scratch_row]
 
             else:
                 raise NotImplementedError(f"IxformerQuantMoE: down_weight_dtype must be 'torch.int8' or 'int4', got {self.down_weight_dtype}.")
 
-            expert_outputs = group_gemm_output2.view(-1, self.top_k, self.hidden_size)
+            if expert_major:
+                # Gather the expert-major rows inside the reduce instead of
+                # scattering them to token order first: the scatter moved the
+                # whole activation twice for nothing.
+                #
+                # The CSR is a plain arange because packed row == slot here, so
+                # slots with no routed row stay in it and are neutralised by a
+                # zero weight. Pointing those at row 0 rather than dropping them
+                # keeps every shape independent of device data, which is what
+                # makes the path graph capturable.
+                slots = src_to_dst.reshape(-1)
+                routed = slots >= 0
+                combined = ixf_f.moe_output_reduce_sum_ep(
+                    input=group_gemm_output2,
+                    token_row_offsets=torch.arange(
+                        0, (num_tokens + 1) * self.top_k, self.top_k,
+                        dtype=torch.int32, device=slots.device,
+                    ),
+                    weights=torch.where(routed, top_k_gates.reshape(-1), 0.0),
+                    packed_to_expert_row=torch.where(routed, slots, 0),
+                )
+            else:
+                expert_outputs = group_gemm_output2.view(-1, self.top_k, self.hidden_size)
 
-            # src_to_dst == -1 marks padding slots that must not be summed.
-            reduce_mask = src_to_dst == -1
+                # src_to_dst == -1 marks padding slots that must not be summed.
+                reduce_mask = src_to_dst == -1
 
-            combined = ixf_f.moe_output_reduce_sum(
-                input=expert_outputs,
-                topk_weight=top_k_gates,
-                mask=reduce_mask,
-            )
+                combined = ixf_f.moe_output_reduce_sum(
+                    input=expert_outputs,
+                    topk_weight=top_k_gates,
+                    mask=reduce_mask,
+                )
 
         # Sum partial expert outputs across EP ranks; reduce_scatter slices the result back to the rank's DP shard.
         if self.ep_size > 1:
