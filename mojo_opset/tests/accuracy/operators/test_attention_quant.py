@@ -943,6 +943,11 @@ def test_paged_prefill_gqa_fp8(
     gqa_layout: str,
     per_head_scale: bool,
 ):
+    head_dim = query.shape[-1]
+    if head_dim % 64 != 0:
+        pytest.skip(
+            f"ixattn fp8 FMHA requires head_dim % 64 == 0, got {head_dim}."
+        )
     batch_size = cu_q_lens.numel() - 1
     num_kv_heads = k_cache.shape[1]
     query_q, query_scale = _quantize_fp8_query(
@@ -1023,6 +1028,11 @@ def test_paged_prefill_swa_fp8(
     local_window: int,
     per_head_scale: bool,
 ):
+    head_dim = query.shape[-1]
+    if head_dim % 64 != 0:
+        pytest.skip(
+            f"ixattn fp8 FMHA requires head_dim % 64 == 0, got {head_dim}."
+        )
     batch_size = cu_q_lens.numel() - 1
     num_kv_heads = k_cache.shape[1]
     query_q, query_scale = _quantize_fp8_query(
