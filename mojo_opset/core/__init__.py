@@ -17,7 +17,9 @@ from .operators.activation import MojoSwiGLU
 """ attention """
 from .operators.attention import MojoDecodeGQA
 from .operators.attention import MojoPagedDecodeGQA
+from .operators.attention import MojoPagedDecodeGQAFp8
 from .operators.attention import MojoPagedDecodeSWA
+from .operators.attention import MojoPagedDecodeSWAFp8
 from .operators.attention import MojoPagedPrefillGQA
 from .operators.attention import MojoPagedPrefillGQAFp8
 from .operators.attention import MojoPagedPrefillSWA
@@ -122,10 +124,12 @@ __all__ = [
     "MojoPagedPrefillGQAFp8",
     "MojoDecodeGQA",
     "MojoPagedDecodeGQA",
+    "MojoPagedDecodeGQAFp8",
     "MojoSdpa",
     "MojoPagedPrefillSWA",
     "MojoPagedPrefillSWAFp8",
     "MojoPagedDecodeSWA",
+    "MojoPagedDecodeSWAFp8",
     "MojoSWA",
 
     "MojoStorePagedKVCache",

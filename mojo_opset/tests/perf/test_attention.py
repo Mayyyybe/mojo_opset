@@ -6,6 +6,8 @@ import pytest
 import torch
 
 from mojo_opset import MojoPagedDecodeGQA
+from mojo_opset import MojoPagedDecodeGQAFp8
+from mojo_opset import MojoPagedDecodeSWAFp8
 from mojo_opset import MojoPagedPrefillGQA
 from mojo_opset import MojoPagedPrefillGQAFp8
 from mojo_opset import MojoSdpa
@@ -562,6 +564,83 @@ test_configs_prefill_fp8 = [
     (2, 16, 4, 64, 1024, 0, 128, torch.bfloat16, "M_FP8_D64"),
     (2, 8, 1, 128, 4096, 8192, 128, torch.bfloat16, "M_FP8_WITH_CACHE"),
 ]
+
+
+@pytest.mark.parametrize(
+    "batch_size, num_q_heads, num_kv_heads, head_dim, max_seq_len, block_size",
+    [
+        (8, 16, 4, 128, 1024, 32),
+        (8, 16, 4, 256, 1024, 16),
+        (8, 8, 1, 128, 8192, 16),
+    ],
+)
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@auto_switch_platform(set_perf=True)
+@bypass_not_implemented
+def test_paged_decode_gqa_fp8(
+    batch_size, num_q_heads, num_kv_heads, head_dim, max_seq_len, block_size, fp8_dtype
+):
+    from mojo_opset.utils.platform import get_torch_device
+
+    query, key, value, lengths, tables = generate_paged_decode_data(
+        batch_size, num_q_heads, num_kv_heads, head_dim, max_seq_len, block_size, torch.bfloat16
+    )
+    max_length = int(lengths.max().item())
+    device = get_torch_device()
+    query, key, value = (tensor.to(device=device, dtype=fp8_dtype) for tensor in (query, key, value))
+    lengths, tables = lengths.to(device), tables.to(device)
+    query_scale = torch.ones(batch_size, num_q_heads, device=device, dtype=torch.float32)
+    key_scale = torch.ones(key.shape[:-1], device=device, dtype=torch.float32)
+    value_scale = torch.ones(num_kv_heads, head_dim, device=device, dtype=torch.float32)
+    op = MojoPagedDecodeGQAFp8(output_dtype=torch.bfloat16)
+
+    perf(  # noqa: F821
+        lambda: op(
+            query,
+            query_scale,
+            key,
+            key_scale,
+            value,
+            value_scale,
+            lengths,
+            tables,
+            max_total_seq_len=max_length,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size, num_q_heads, num_kv_heads, head_dim, max_seq_len, block_size",
+    [(8, 16, 4, 128, 1024, 32), (8, 16, 4, 256, 1024, 16), (8, 8, 1, 128, 8192, 16)],
+)
+@pytest.mark.parametrize("global_window, local_window", [(0, 255), (4, 255)])
+@pytest.mark.parametrize("fp8_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@auto_switch_platform(set_perf=True)
+@bypass_not_implemented
+def test_paged_decode_swa_fp8(
+    batch_size, num_q_heads, num_kv_heads, head_dim, max_seq_len, block_size,
+    global_window, local_window, fp8_dtype,
+):
+    from mojo_opset.utils.platform import get_torch_device
+
+    query, key, value, lengths, tables = generate_paged_decode_data(
+        batch_size, num_q_heads, num_kv_heads, head_dim, max_seq_len, block_size, torch.bfloat16
+    )
+    max_length = int(lengths.max().item())
+    device = get_torch_device()
+    query, key, value = (tensor.to(device=device, dtype=fp8_dtype) for tensor in (query, key, value))
+    lengths, tables = lengths.to(device), tables.to(device)
+    query_scale = torch.ones(batch_size, num_q_heads, device=device, dtype=torch.float32)
+    key_scale = torch.ones(key.shape[:-1], device=device, dtype=torch.float32)
+    value_scale = torch.ones(num_kv_heads, head_dim, device=device, dtype=torch.float32)
+    op = MojoPagedDecodeSWAFp8(global_window_size=global_window, local_window_size=local_window)
+
+    perf(  # noqa: F821
+        lambda: op(
+            query, query_scale, key, key_scale, value, value_scale, lengths, tables,
+            max_total_seq_len=max_length,
+        )
+    )
 
 
 @pytest.mark.parametrize(

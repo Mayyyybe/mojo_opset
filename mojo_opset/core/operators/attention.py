@@ -229,6 +229,78 @@ class MojoPagedDecodeGQA(MojoOperator):
         return f"{self.is_causal=}, {self.gqa_layout=}".replace("self.", "")
 
 
+class MojoPagedDecodeGQAFp8(MojoOperator):
+    """Single-token paged GQA with FP8 Q/K/V and fp16/bf16 output."""
+
+    def __init__(
+        self,
+        is_causal: bool = True,
+        gqa_layout: str = "AABB",
+        output_dtype: torch.dtype = torch.bfloat16,
+    ):
+        super().__init__()
+        if gqa_layout not in ("ABAB", "AABB"):
+            raise ValueError(f"gqa_layout must be 'ABAB' or 'AABB', got {gqa_layout}")
+        if output_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(f"output_dtype must be fp16 or bf16, got {output_dtype}")
+        self.is_causal = is_causal
+        self.gqa_layout = gqa_layout
+        self.output_dtype = output_dtype
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        query_scale: torch.Tensor,
+        key_cache: torch.Tensor,
+        key_scale: torch.Tensor,
+        value_cache: torch.Tensor,
+        value_scale: torch.Tensor,
+        total_seq_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        softmax_scale: Optional[float] = None,
+        *,
+        max_total_seq_len: int,
+    ) -> torch.Tensor:
+        """Attend one query to each sequence's visible paged KV cache.
+
+        Args:
+            query: FP8 e4m3fn/e5m2 tensor of shape ``(B, Hq, D)``.
+            query_scale: Float32 dequantization scales of shape ``(B, Hq)``.
+            key_cache: FP8 tensor of shape ``(N_blocks, Hkv, block_size, D)``.
+            key_scale: Float32 per-token scales, ``(N_blocks, Hkv, block_size)``.
+            value_cache: FP8 tensor with the same shape and dtype as key_cache.
+            value_scale: Float32 per-channel scales, ``(Hkv, D)``.
+            total_seq_lens: Int32 visible KV lengths, shape ``(B,)``.
+            block_tables: Int32 physical block IDs, shape ``(B, max_blocks)``.
+            softmax_scale: Defaults to ``1/sqrt(D)``.
+            max_total_seq_len: Positive maximum visible KV length; a host integer
+                supplied by the caller to avoid device synchronization in ixformer.
+
+        Returns:
+            Tensor of shape ``(B, Hq, D)`` in ``output_dtype``.
+
+        The ixformer backend supports causal AABB attention with D=128/256 and
+        block_size=16/32. Unlike FP8 prefill, decode scales are per query head,
+        per K token and per V channel, not per tensor or per-(batch, KV head).
+        """
+        query_dequant = query.float() * query_scale.float().unsqueeze(-1)
+        key_dequant = key_cache.float() * key_scale.float().unsqueeze(-1)
+        value_dequant = value_cache.float() * value_scale.float()[None, :, None, :]
+        return MojoPagedDecodeGQA.forward(
+            self,
+            query_dequant,
+            key_dequant,
+            value_dequant,
+            total_seq_lens,
+            block_tables,
+            softmax_scale=softmax_scale,
+            max_total_seq_len=max_total_seq_len,
+        ).to(self.output_dtype)
+
+    def extra_repr(self) -> str:
+        return f"{self.is_causal=}, {self.gqa_layout=}, {self.output_dtype=}".replace("self.", "")
+
+
 class MojoPrefillGQA(MojoOperator):
     """
     GQA attention operator.
@@ -987,6 +1059,86 @@ class MojoPagedDecodeSWA(MojoOperator):
 
     def extra_repr(self) -> str:
         return f"is_causal={self.is_causal}, gqa_layout={self.gqa_layout}, global_window_size={self.global_window_size}, local_window_size={self.local_window_size}"
+
+
+class MojoPagedDecodeSWAFp8(MojoOperator):
+    """Single-token paged SWA with FP8 Q/K/V and fp16/bf16 output."""
+
+    def __init__(
+        self,
+        is_causal: bool = True,
+        gqa_layout: str = "AABB",
+        global_window_size: Optional[int] = None,
+        local_window_size: Optional[int] = None,
+        output_dtype: torch.dtype = torch.bfloat16,
+    ):
+        super().__init__()
+        if gqa_layout not in ("ABAB", "AABB"):
+            raise ValueError(f"gqa_layout must be 'ABAB' or 'AABB', got {gqa_layout}")
+        if output_dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(f"output_dtype must be fp16 or bf16, got {output_dtype}")
+        if global_window_size is not None and global_window_size < 0:
+            raise ValueError(f"global_window_size must be >= 0, got {global_window_size}")
+        if local_window_size is not None and local_window_size < 0:
+            raise ValueError(f"local_window_size must be >= 0, got {local_window_size}")
+        self.is_causal = is_causal
+        self.gqa_layout = gqa_layout
+        self.gqa_interleave = gqa_layout == "ABAB"
+        self.global_window_size = global_window_size or None
+        self.local_window_size = local_window_size
+        self.output_dtype = output_dtype
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        query_scale: torch.Tensor,
+        key_cache: torch.Tensor,
+        key_scale: torch.Tensor,
+        value_cache: torch.Tensor,
+        value_scale: torch.Tensor,
+        total_seq_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+        softmax_scale: Optional[float] = None,
+        *,
+        max_total_seq_len: int,
+    ) -> torch.Tensor:
+        """Attend to the union of the local window and global prefix.
+
+        Q/K/V shapes, FP8 dtypes and dequantization scales follow
+        :class:`MojoPagedDecodeGQAFp8`: Q scales are ``(B, Hq)``, K scales
+        ``(N_blocks, Hkv, block_size)``, and V scales ``(Hkv, D)``.
+        Output is ``(B, Hq, D)`` in ``output_dtype``. ``max_total_seq_len``
+        is a positive host integer supplied by the caller.
+
+        At query position p, local_window_size=L includes [max(0, p-L), p],
+        and global_window_size=G adds the first G visible KV tokens. An
+        overlap is counted once. None/0 disables the global prefix; both
+        windows unset means full causal attention.
+
+        The ixformer backend requires causal AABB, D=128/256, block_size=16/32,
+        and a positive local window when one is set. A positive global prefix
+        requires a local window on that backend.
+        """
+        query_dequant = query.float() * query_scale.float().unsqueeze(-1)
+        key_dequant = key_cache.float() * key_scale.float().unsqueeze(-1)
+        value_dequant = value_cache.float() * value_scale.float()[None, :, None, :]
+        return MojoPagedDecodeSWA.forward(
+            self,
+            query_dequant,
+            key_dequant,
+            value_dequant,
+            total_seq_lens,
+            block_tables,
+            softmax_scale=softmax_scale,
+            max_total_seq_len=max_total_seq_len,
+        ).to(self.output_dtype)
+
+    def extra_repr(self) -> str:
+        return (
+            f"is_causal={self.is_causal}, gqa_layout={self.gqa_layout}, "
+            f"global_window_size={self.global_window_size}, local_window_size={self.local_window_size}, "
+            f"output_dtype={self.output_dtype}"
+        )
 
 
 class MojoSWA(MojoOperator):
