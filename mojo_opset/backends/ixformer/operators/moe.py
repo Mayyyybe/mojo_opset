@@ -210,7 +210,19 @@ def _swizzle_weights_post_hook(module, incompatible_keys):
     """load_state_dict post-hook: convert int4/int8 weights from TN (checkpoint) to NN (ixformer) format."""
     device = module.up_proj_weight.device
     module.up_proj_quantize.inv_smooth_scale = torch.nn.Parameter(module.up_proj_quantize.inv_smooth_scale.data.to(dtype=torch.bfloat16))
-    
+
+    # The up-projection smooth scale is indexed per expert, so it can normally only
+    # be applied after routing. When every local expert carries the same row the
+    # scale is effectively per-channel, and the EP expand can then smooth and
+    # quantize once per token instead of once per expanded row. Decide it here:
+    # the comparison is a host sync and must not happen inside forward.
+    inv_s = module.up_proj_quantize.inv_smooth_scale.data
+    module.up_smooth_per_channel = bool(
+        inv_s.shape[0] > 0 and torch.equal(inv_s, inv_s[:1].expand_as(inv_s))
+    )
+    module.up_smooth_row = inv_s[0].contiguous() if module.up_smooth_per_channel else None
+
+
     if module.up_weight_dtype == "int4":
         N_up = module.intermediate_size * 2
         K_up = module.hidden_size
@@ -674,22 +686,55 @@ class IxformerQuantMoE(MojoQuantMoE):
 
         need_gpu_size = self.disable_sync or enable_cuda_graph
         graph_safe_ep = self.ep_size > 1 and need_gpu_size
+        needs_group_layout = "int4" in (self.up_weight_dtype, self.down_weight_dtype)
 
         if self.ep_size > 1:
-            # _ep variant filters tokens to the local expert range [ep_start, ep_end);
-            # expand_tokens is the actual local token count after filtering.
+            # _ep_packed filters tokens to the local expert range [ep_start, ep_end)
+            # exactly like _ep -- src_to_expert_row is the classic slot -> expert-row
+            # map, -1 on non-local slots -- but it additionally emits the token-major
+            # packed metadata the reduce consumes, so the CSR, the per-row weights and
+            # the group layout no longer get rebuilt here on every forward.
+            #
+            # dst_to_src, group_layout and packed_to_expert_row are out-params the
+            # same routing kernel fills with no extra launch. It writes only
+            # [0, expand_tokens) of the index tensors and never slices them, so the
+            # -1 prefill that _ep did internally under graph_safe has to happen here:
+            # the fixed-capacity consumers below identify padding rows by -1.
+            sorted_token_ids = top_k_indices.new_empty(num_tokens * self.top_k)
+            if graph_safe_ep:
+                sorted_token_ids.fill_(-1)
+            group_layout = (
+                torch.empty((self.num_experts_local, 2), dtype=torch.int32, device=hidden_states.device)
+                if needs_group_layout
+                else None
+            )
+            packed_to_expert_row = top_k_indices.new_empty(num_tokens * self.top_k)
             (src_to_dst,
-             sorted_token_ids,
-             expert_sizes_gpu,
-             expert_sizes_cpu,
-             expand_tokens) = ixf_f.moe_compute_token_index_ep(
-                top_k_indices,
-                self.num_experts,
-                self.ep_start,
-                self.ep_end,
-                gdr_buffer_ptr=None if need_gpu_size else self.gdr_buffer_ptr,
+             _dst_to_packed,
+             weights_packed,
+             token_row_offsets,
+             expert_sizes,
+             expand_tokens) = ixf_f.moe_compute_token_index_ep_packed(
+                topk_ids=top_k_indices.contiguous(),
+                num_experts=self.num_experts,
+                start_expert_id=self.ep_start,
+                end_expert_id=self.ep_end,
+                topk_weights=top_k_gates,
+                dst_to_src=sorted_token_ids,
+                group_layout=group_layout,
+                packed_to_expert_row=packed_to_expert_row,
                 graph_safe=graph_safe_ep,
             )
+            # graph_safe already decides the residency of the size outputs, and in
+            # this branch graph_safe_ep is need_gpu_size, so the one returned tensor
+            # is whichever of the two tokens_per_expert goes on to select.
+            expert_sizes_gpu = expert_sizes_cpu = expert_sizes
+            # _ep handed back a dst_to_src already sliced down to the local token
+            # count unless graph_safe asked for fixed capacity. The packed op always
+            # returns full capacity, and the consumers below require numel to equal
+            # their own row count, so reproduce the slice (a view, no copy).
+            if not graph_safe_ep:
+                sorted_token_ids = sorted_token_ids[:expand_tokens]
         else:
             (src_to_dst,
              sorted_token_ids,
@@ -703,7 +748,18 @@ class IxformerQuantMoE(MojoQuantMoE):
 
         dispatch_tokens = num_tokens * self.top_k if graph_safe_ep else expand_tokens
 
-        if sorted_token_ids.shape[0] == 0:
+        # The fused smooth kernels index smooth_scales by expert id, but that
+        # parameter only holds this rank's local experts while top_k_indices carries
+        # global ids. The two coincide only at ep_start == 0, so every other rank was
+        # reading past the end of smooth_scales. The routing op above still wants the
+        # global ids, so shift into a separate tensor rather than in place.
+        local_expert_ids = top_k_indices - self.ep_start if self.ep_start else top_k_indices
+
+        # _ep_packed returns a full-capacity dst_to_src instead of one sliced down to
+        # the local token count, so "nothing routed here" has to be read off
+        # expand_tokens. Under graph_safe that count lives on device and must not be
+        # inspected, which is fine: the path is fixed-capacity by construction.
+        if not graph_safe_ep and expand_tokens == 0:
             combined = torch.zeros(
                 num_tokens, self.hidden_size,
                 dtype=hidden_states.dtype, device=hidden_states.device,
@@ -711,24 +767,57 @@ class IxformerQuantMoE(MojoQuantMoE):
         else:
 
             tokens_per_expert = expert_sizes_gpu if need_gpu_size else expert_sizes_cpu
-            # Both w4a8 GEMMs read the same expert ranges, so build them once.
-            group_layout = (
-                _group_layout_from_expert_sizes(tokens_per_expert, hidden_states.device)
-                if "int4" in (self.up_weight_dtype, self.down_weight_dtype)
-                else None
-            )
+            # Both w4a8 GEMMs read the same expert ranges. Under EP the routing op
+            # already filled group_layout as an out-param, which also keeps the
+            # layout off the host; without EP there is no such op, so build it here.
+            if self.ep_size == 1:
+                group_layout = (
+                    _group_layout_from_expert_sizes(tokens_per_expert, hidden_states.device)
+                    if needs_group_layout
+                    else None
+                )
 
-            # Fuses expert-sort, expansion, smooth-quant scaling, and dynamic-int8 quantization into one kernel.
-            i8_hs, quant_scale = ixf_f.moe_expand_input_dynamic_scaled_int8(
-                hidden_states=hidden_states,
-                dst_to_src=sorted_token_ids,
-                dst_tokens=dispatch_tokens,
-                topk=self.top_k,
-                src_to_dst=src_to_dst,
-                topk_ids=top_k_indices,
-                smooth_scales=self.experts.up_proj_quantize.inv_smooth_scale,
-                check_valid=graph_safe_ep,
-            )
+            if self.ep_size > 1 and self.experts.up_smooth_per_channel:
+                # Smooth and quantize once per token, then scatter int8 rows into
+                # expert-major order. Each of a token's topk copies is the same row,
+                # so per-expanded-row dynamic quant would compute the same int8
+                # values and scale anyway; doing it first touches num_tokens rows
+                # instead of dispatch_tokens and lets the scatter move 1 byte per
+                # element instead of 2. Only valid when the smooth scale is
+                # per-channel rather than per-expert, which the load hook decided.
+                #
+                # src_to_expert_row carries -1 on non-local slots and the scatter
+                # skips them, so rows that no slot claims stay untouched. Nothing
+                # downstream reads them: the group GEMMs are bounded by the expert
+                # ranges and the reduce by token_row_offsets.
+                i8_hidden, hs_scale = ixf_f.scaled_int8_quant(
+                    hidden_states * self.experts.up_smooth_row
+                )
+                i8_hs = torch.empty((dispatch_tokens, dim), dtype=torch.int8, device=hidden_states.device)
+                quant_scale = torch.empty((dispatch_tokens,), dtype=torch.float32, device=hidden_states.device)
+                ixf_f.moe_expand_input_ep(
+                    hidden_states=i8_hidden,
+                    src_to_expert_row=src_to_dst,
+                    expand_tokens=dispatch_tokens,
+                    topk=self.top_k,
+                    output=i8_hs,
+                    input_scale=hs_scale,
+                    output_scale=quant_scale,
+                )
+            else:
+                # Per-expert smooth scale (or no EP): the scale is only known after
+                # routing, so expert-sort, expansion, smooth scaling and dynamic
+                # int8 quant all have to happen in the one fused kernel.
+                i8_hs, quant_scale = ixf_f.moe_expand_input_dynamic_scaled_int8(
+                    hidden_states=hidden_states,
+                    dst_to_src=sorted_token_ids,
+                    dst_tokens=dispatch_tokens,
+                    topk=self.top_k,
+                    src_to_dst=src_to_dst,
+                    topk_ids=local_expert_ids,
+                    smooth_scales=self.experts.up_proj_quantize.inv_smooth_scale,
+                    check_valid=graph_safe_ep,
+                )
             i8_hs = i8_hs.view(-1, dim)
 
             # gemv variant takes GPU-side sizes so kernel shapes don't depend on CPU values during graph capture.
@@ -771,14 +860,25 @@ class IxformerQuantMoE(MojoQuantMoE):
             else:
                 raise NotImplementedError(f"IxformerQuantMoE: up_weight_dtype must be 'torch.int8' or 'int4', got {self.up_weight_dtype}.")
 
-            # Fuses swiglu activation, smooth-quant scaling, and dynamic-int8 quant ahead of the down projection.
+            # Fuses swiglu activation, smooth-quant scaling, and dynamic-int8 quant
+            # ahead of the down projection. The down smooth scale is per expert, but
+            # these rows are already in expert-major order, so dst_to_src + topk_ids
+            # resolve the expert per row and the scale survives the EP path intact.
+            #
+            # Under graph-safe EP the up GEMM wrote full capacity while only
+            # [0, expand_tokens) carry routed rows, so bound the work on the
+            # device-side count: no host sync, and the bound does not depend on the
+            # -1 sentinel surviving in dst_to_src. check_valid stays on because
+            # expand_tokens_gpu is documented to bound the writes, not the topk_ids
+            # reads. Outside graph-safe the buffer is already exactly sized.
             act_i8, act_scale = ixf_f.activation_dynamic_scaled_int8(
                 input=group_gemm_output1,
                 smooth_scales=self.experts.down_proj_quantize.inv_smooth_scale,
                 dst_to_src=sorted_token_ids,
-                topk_ids=top_k_indices,
+                topk_ids=local_expert_ids,
                 act_type="swiglu",
                 check_valid=graph_safe_ep,
+                expand_tokens_gpu=expand_tokens if graph_safe_ep else None,
             )
 
             group_gemm_output2 = torch.empty(
@@ -838,23 +938,35 @@ class IxformerQuantMoE(MojoQuantMoE):
                 # Gather the expert-major rows inside the reduce instead of
                 # scattering them to token order first: the scatter moved the
                 # whole activation twice for nothing.
-                #
-                # The CSR is a plain arange because packed row == slot here, so
-                # slots with no routed row stay in it and are neutralised by a
-                # zero weight. Pointing those at row 0 rather than dropping them
-                # keeps every shape independent of device data, which is what
-                # makes the path graph capturable.
-                slots = src_to_dst.reshape(-1)
-                routed = slots >= 0
-                combined = ixf_f.moe_output_reduce_sum_ep(
-                    input=group_gemm_output2,
-                    token_row_offsets=torch.arange(
-                        0, (num_tokens + 1) * self.top_k, self.top_k,
-                        dtype=torch.int32, device=slots.device,
-                    ),
-                    weights=torch.where(routed, top_k_gates.reshape(-1), 0.0),
-                    packed_to_expert_row=torch.where(routed, slots, 0),
-                )
+                if self.ep_size > 1:
+                    # The routing op emitted the CSR, the packed-order weights and
+                    # the packed -> expert-row map directly on device, so nothing is
+                    # rebuilt here. The CSR spans only the rows that actually routed,
+                    # so unrouted slots are absent rather than carried with a zero
+                    # weight, and every shape still comes from host-side constants.
+                    combined = ixf_f.moe_output_reduce_sum_ep(
+                        input=group_gemm_output2,
+                        token_row_offsets=token_row_offsets,
+                        weights=weights_packed,
+                        packed_to_expert_row=packed_to_expert_row,
+                    )
+                else:
+                    # Non-EP routing has no packed metadata. Every slot owns one
+                    # expert row there, so the CSR is a plain arange and packed row
+                    # == slot; slots with no routed row are pointed at row 0 and
+                    # neutralised by a zero weight, which keeps every shape
+                    # independent of device data.
+                    slots = src_to_dst.reshape(-1)
+                    routed = slots >= 0
+                    combined = ixf_f.moe_output_reduce_sum_ep(
+                        input=group_gemm_output2,
+                        token_row_offsets=torch.arange(
+                            0, (num_tokens + 1) * self.top_k, self.top_k,
+                            dtype=torch.int32, device=slots.device,
+                        ),
+                        weights=torch.where(routed, top_k_gates.reshape(-1), 0.0),
+                        packed_to_expert_row=torch.where(routed, slots, 0),
+                    )
             else:
                 expert_outputs = group_gemm_output2.view(-1, self.top_k, self.hidden_size)
 
